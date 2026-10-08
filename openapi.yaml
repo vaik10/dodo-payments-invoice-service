@@ -1,0 +1,661 @@
+openapi: 3.0.3
+info:
+  title: Dodo Payments Invoice API
+  description: |
+    Minimal API for creating customers, issuing invoices, and processing payments.
+
+    **Money** is always an integer number of US cents (`*_cents`, int64). There are no floats in the API.
+
+    **Errors** share a single shape, `ErrorResponse`. `error` is a stable machine-readable code and
+    `message` is human-readable. State-machine rejections also carry `current_state` and `requested_state`,
+    and PSP timeouts carry `payment_attempt_id`.
+
+    **Webhooks** are POSTed as JSON to registered endpoints with these headers:
+    - `Dodo-Signature: t={unix_ts},v1={hex(HMAC-SHA256(signing_secret, "{unix_ts}.{raw_body}"))}`
+    - `Dodo-Webhook-Id`: delivery id (use it to dedupe)
+    - `Dodo-Webhook-Timestamp`: `{unix_ts}`
+
+    Events: `invoice.created`, `invoice.issued`, `invoice.paid`, `invoice.payment_failed`.
+    Failed deliveries are retried at 30s, 2m, 15m, 1h, 4h (6 attempts total), then marked `failed`.
+  version: 1.0.0
+servers:
+  - url: http://localhost:8080
+    description: Local (docker compose)
+
+security:
+  - ApiKeyAuth: []
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: http
+      scheme: bearer
+      description: "API key, e.g. `Authorization: Bearer dodo_live_...`"
+
+  parameters:
+    Id:
+      in: path
+      name: id
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    BadRequest:
+      description: Validation error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: validation_error
+            message: Invoice must have at least one line item
+    Unauthorized:
+      description: Missing or invalid API key
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: unauthorized
+            message: Invalid API key
+    NotFound:
+      description: Resource not found (or belongs to another business)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: not_found
+            message: Invoice not found
+    InvalidTransition:
+      description: The invoice's current state does not allow this transition
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: invalid_state_transition
+            message: Cannot transition invoice from 'paid' to 'void'
+            current_state: paid
+            requested_state: void
+    InvoiceTransitioned:
+      description: Invoice after the transition
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/InvoiceResponse'
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable code
+          example: invalid_state_transition
+        message:
+          type: string
+        current_state:
+          type: string
+          description: Present on `invalid_state_transition`
+        requested_state:
+          type: string
+          description: Present on `invalid_state_transition`
+        payment_attempt_id:
+          type: string
+          format: uuid
+          description: Present on `psp_timeout`; the attempt whose outcome is unknown
+
+    CreateBusinessRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+    Business:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    ApiKeyCreated:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        raw_key:
+          type: string
+          description: Shown exactly once. Only a SHA-256 hash is stored.
+          example: dodo_live_AbCdEfGh0123456789AbCdEfGh012345
+
+    CreateCustomerRequest:
+      type: object
+      required: [name, email]
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+    CustomerResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        email:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CreateLineItemRequest:
+      type: object
+      required: [description, quantity, unit_amount_cents]
+      properties:
+        description:
+          type: string
+        quantity:
+          type: integer
+          format: int32
+          minimum: 1
+        unit_amount_cents:
+          type: integer
+          format: int64
+          minimum: 0
+    CreateInvoiceRequest:
+      type: object
+      required: [customer_id, due_date, line_items]
+      description: The total is always computed server-side from the line items.
+      properties:
+        customer_id:
+          type: string
+          format: uuid
+        due_date:
+          type: string
+          format: date
+        line_items:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/CreateLineItemRequest'
+    LineItemResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        description:
+          type: string
+        quantity:
+          type: integer
+          format: int32
+        unit_amount_cents:
+          type: integer
+          format: int64
+        line_total_cents:
+          type: integer
+          format: int64
+    InvoiceResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        customer_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [draft, issued, paid, void, uncollectible]
+        total_amount_cents:
+          type: integer
+          format: int64
+        due_date:
+          type: string
+          format: date
+        line_items:
+          type: array
+          description: Always empty in list responses; fetch the invoice by id for line items.
+          items:
+            $ref: '#/components/schemas/LineItemResponse'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    PayInvoiceRequest:
+      type: object
+      required: [card_token]
+      properties:
+        card_token:
+          type: string
+          description: Mock PSP token
+          enum: [tok_success, tok_insufficient_funds, tok_card_declined, tok_timeout, tok_network_error]
+    PaymentAttemptResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        invoice_id:
+          type: string
+          format: uuid
+        amount_cents:
+          type: integer
+          format: int64
+        status:
+          type: string
+          enum: [succeeded, failed]
+        failure_code:
+          type: string
+          nullable: true
+          example: card_declined
+        failure_message:
+          type: string
+          nullable: true
+        psp_ref:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+    CreateWebhookEndpointRequest:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+    WebhookEndpointResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        url:
+          type: string
+        active:
+          type: boolean
+        signing_secret:
+          type: string
+          description: Used to verify `Dodo-Signature` on deliveries
+        created_at:
+          type: string
+          format: date-time
+
+paths:
+  /health:
+    get:
+      summary: Liveness check
+      security: []
+      responses:
+        '200':
+          description: Service is up
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: OK
+
+  /businesses:
+    post:
+      summary: Create a business
+      description: Bootstrap endpoint (unauthenticated) for local use and the demo.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBusinessRequest'
+      responses:
+        '201':
+          description: Business created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Business'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /businesses/{business_id}/api-keys:
+    post:
+      summary: Create an API key for a business
+      description: Bootstrap endpoint (unauthenticated) for local use and the demo.
+      security: []
+      parameters:
+        - in: path
+          name: business_id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '201':
+          description: Key created. `raw_key` is returned only in this response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiKeyCreated'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /customers:
+    get:
+      summary: List customers
+      parameters:
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 50
+        - in: query
+          name: offset
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Customers of the authenticated business, newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CustomerResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      summary: Create a customer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCustomerRequest'
+      responses:
+        '201':
+          description: Customer created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomerResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: A customer with this email already exists for this business
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: customer_already_exists
+                message: Customer with this email already exists
+
+  /customers/{id}:
+    get:
+      summary: Get a customer
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: Customer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomerResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /invoices:
+    get:
+      summary: List invoices
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [draft, issued, paid, void, uncollectible]
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 100
+        - in: query
+          name: offset
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Invoices of the authenticated business, newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/InvoiceResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      summary: Create an invoice (in `draft`)
+      description: Emits `invoice.created`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateInvoiceRequest'
+      responses:
+        '201':
+          description: Invoice created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /invoices/{id}:
+    get:
+      summary: Get an invoice with its line items
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: Invoice
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /invoices/{id}/finalize:
+    post:
+      summary: Finalize (`draft` → `issued`)
+      description: Emits `invoice.issued`.
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          $ref: '#/components/responses/InvoiceTransitioned'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/InvalidTransition'
+
+  /invoices/{id}/void:
+    post:
+      summary: Void (`draft` or `issued` → `void`, terminal)
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          $ref: '#/components/responses/InvoiceTransitioned'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/InvalidTransition'
+
+  /invoices/{id}/mark-uncollectible:
+    post:
+      summary: Write off (`issued` → `uncollectible`)
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          $ref: '#/components/responses/InvoiceTransitioned'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/InvalidTransition'
+
+  /invoices/{id}/reopen:
+    post:
+      summary: Reopen (`uncollectible` → `issued`)
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          $ref: '#/components/responses/InvoiceTransitioned'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/InvalidTransition'
+
+  /invoices/{id}/pay:
+    post:
+      summary: Pay an `issued` invoice
+      description: |
+        Charges the invoice total through the PSP. Requires an `Idempotency-Key`: a retry with the same
+        key and body replays the original response without calling the PSP again. Concurrent requests for the
+        same invoice are serialized by a row lock, so at most one can charge.
+
+        On success the invoice becomes `paid` and `invoice.paid` is emitted. On a decline the invoice stays
+        `issued` and `invoice.payment_failed` is emitted.
+      parameters:
+        - $ref: '#/components/parameters/Id'
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PayInvoiceRequest'
+      responses:
+        '200':
+          description: Payment succeeded; invoice is now `paid`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentAttemptResponse'
+        '400':
+          description: Missing `Idempotency-Key` header
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: missing_idempotency_key
+                message: Idempotency-Key header is required
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            Invoice is not `issued` (`invalid_state_transition`, e.g. already paid), or a request with this
+            idempotency key is still in flight (`concurrent_request`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: |
+            Either the PSP declined the card (body is a `PaymentAttemptResponse` with `status: failed`; invoice
+            stays `issued`), or the idempotency key was reused with a different body (`ErrorResponse` with
+            `error: idempotency_key_mismatch`).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/PaymentAttemptResponse'
+                  - $ref: '#/components/schemas/ErrorResponse'
+        '504':
+          description: |
+            The PSP timed out (5s) or errored, so the charge outcome is unknown. The invoice stays `issued`, and
+            the attempt is recorded as `pending_resolution` under `payment_attempt_id`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: psp_timeout
+                message: Payment processing timeout, state is pending resolution
+                payment_attempt_id: 09708008-e502-4ac1-97e2-3031b9b18da2
+
+  /webhook-endpoints:
+    post:
+      summary: Register a webhook endpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWebhookEndpointRequest'
+      responses:
+        '201':
+          description: Endpoint registered. Store `signing_secret` to verify deliveries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebhookEndpointResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
