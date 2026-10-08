@@ -1,0 +1,13 @@
+# Rust build output
+/target/
+
+# Local environment (keep .env.example committed)
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
