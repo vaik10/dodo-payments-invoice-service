@@ -1,0 +1,11 @@
+target/
+.git/
+.gitignore
+.env
+.env.*
+*.md
+hello
+hello.rs
+.DS_Store
+.vscode/
+.idea/
