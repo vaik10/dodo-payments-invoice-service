@@ -2,6 +2,9 @@
 
 A minimal Invoice and Payment Service built in Rust (Axum), backed by PostgreSQL. It provides a robust, idempotency-guaranteed payment flow via a simulated Payment Service Provider (PSP).
 
+## Demo Video Link:
+- https://www.loom.com/share/72cf4131b0e741daa5a0c8302d76f508
+
 ## Features
 - **API Key Authentication**: Secure, hashed API keys scoped to businesses.
 - **Idempotency**: Prevents duplicate processing of payments using deterministic request fingerprinting.
