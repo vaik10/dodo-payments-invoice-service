@@ -12,6 +12,7 @@ use crate::models::{
     CreateInvoiceRequest, ErrorResponse, Invoice, InvoiceResponse, InvoiceStatus, LineItem,
     LineItemResponse, ListInvoicesQuery,
 };
+use crate::reconciliation::unresolved_payment_attempt;
 use crate::webhooks::enqueue_webhook;
 
 pub async fn create_invoice(
@@ -318,6 +319,25 @@ async fn transition_invoice_status(
                 target_status.as_str(),
             )),
         ));
+    }
+
+    // A charge in flight could still succeed, so the invoice must stay payable
+    // (`issued`) until the attempt is resolved.
+    if current_status == InvoiceStatus::Issued {
+        let unresolved = unresolved_payment_attempt(&mut tx, invoice_id)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new("internal_error", "Database error")),
+                )
+            })?;
+        if let Some(attempt_id) = unresolved {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ErrorResponse::payment_pending(attempt_id)),
+            ));
+        }
     }
 
     let updated_invoice = sqlx::query_as::<_, Invoice>(

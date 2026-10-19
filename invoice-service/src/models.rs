@@ -205,6 +205,10 @@ pub struct PaymentAttempt {
     pub failure_message: Option<String>,
     pub psp_ref: Option<String>,
     pub idempotency_key: Option<String>,
+    pub psp_idempotency_key: Option<String>,
+    pub resolution_attempts: i16,
+    pub next_resolution_at: Option<DateTime<Utc>>,
+    pub resolved_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -327,6 +331,17 @@ pub struct PspChargeResponse {
     pub code: Option<String>,
 }
 
+/// Body of the PSP's `GET /charges/{idempotency_key}`.
+#[derive(Debug, Deserialize)]
+pub struct PspChargeLookupResponse {
+    /// `succeeded`, `failed` or `processing`.
+    pub status: String,
+    #[serde(default)]
+    pub psp_ref: Option<String>,
+    #[serde(default)]
+    pub code: Option<String>,
+}
+
 // ── Error response ──
 
 #[derive(Debug, Serialize)]
@@ -362,6 +377,16 @@ impl ErrorResponse {
             current_state: Some(current.to_string()),
             requested_state: Some(requested.to_string()),
             payment_attempt_id: None,
+        }
+    }
+
+    pub fn payment_pending(payment_attempt_id: Uuid) -> Self {
+        Self {
+            payment_attempt_id: Some(payment_attempt_id),
+            ..Self::new(
+                "payment_pending",
+                "A payment attempt for this invoice has not been resolved yet",
+            )
         }
     }
 }

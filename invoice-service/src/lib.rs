@@ -3,6 +3,7 @@
 
 pub mod auth;
 pub mod models;
+pub mod reconciliation;
 pub mod routes;
 pub mod webhooks;
 
@@ -50,14 +51,19 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .timeout(Duration::from_secs(5))
         .build()?;
 
+    // Spawn background workers
+    tokio::spawn(webhooks::webhook_delivery_worker(db.clone()));
+    tokio::spawn(reconciliation::reconciliation_worker(
+        db.clone(),
+        psp_client.clone(),
+        psp_base_url.clone(),
+    ));
+
     let state = AppState {
         db: db.clone(),
         psp_client,
         psp_base_url,
     };
-
-    // Spawn background webhook worker
-    tokio::spawn(webhooks::webhook_delivery_worker(db.clone()));
 
     let app = build_app(state);
 
@@ -105,6 +111,10 @@ pub fn build_app(state: AppState) -> Router {
             post(routes::invoices::reopen_invoice),
         )
         .route("/invoices/{id}/pay", post(routes::payments::pay_invoice))
+        .route(
+            "/payment-attempts/{id}",
+            get(routes::payments::get_payment_attempt),
+        )
         .with_state(state)
         .layer(TraceLayer::new_for_http())
 }

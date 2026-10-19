@@ -122,6 +122,16 @@ curl -X POST http://localhost:8080/invoices/<ANOTHER_INVOICE_ID>/pay \
 ```
 *(Returns `504` with `error: psp_timeout` and a `payment_attempt_id` after ~5s instead of hanging for the PSP's 30s. The invoice stays `issued`. `tok_network_error` behaves the same, but immediately.)*
 
+Until that attempt is resolved, any further `/pay` (even with a new `Idempotency-Key`), `/void` or `/mark-uncollectible` on the invoice returns `409 payment_pending`, so the card can't be charged twice. A background reconciler asks the PSP what happened (`GET /charges/{key}` on the mock PSP), first after ~30s, then with backoff:
+- `tok_timeout`: the PSP did charge, so the attempt becomes `succeeded`, the invoice `paid`, and `invoice.paid` is sent.
+- `tok_network_error`: the PSP never charged, so the attempt becomes `failed` (`psp_no_charge`), and the invoice can be paid again.
+
+Follow the attempt with:
+```bash
+curl http://localhost:8080/payment-attempts/<PAYMENT_ATTEMPT_ID> \
+  -H "Authorization: Bearer <YOUR_RAW_KEY>"
+```
+
 ### 8. Register a Webhook Endpoint
 ```bash
 curl -X POST http://localhost:8080/webhook-endpoints \
@@ -152,6 +162,16 @@ DATABASE_URL=postgres://dodo:dodo_secret@localhost:5432/dodo_payments cargo test
 | `retried_payment_with_same_key_replays_response` | A same-key retry returns an identical body with no second PSP call; the same key with a different body returns `422 idempotency_key_mismatch` |
 | `psp_timeout_leaves_invoice_issued` | A slow PSP returns `504` quickly; the invoice stays `issued` and the attempt is `pending_resolution` |
 | `psp_network_error_leaves_invoice_issued` | Same as above for a PSP `500` |
+
+Reconciliation tests are in [`invoice-service/tests/reconciliation_tests.rs`](./invoice-service/tests/reconciliation_tests.rs). They run one reconciler pass at a time instead of waiting on the background worker.
+
+| Test | Asserts |
+| --- | --- |
+| `unresolved_attempt_blocks_new_payments_and_transitions` | After a `504`, `/pay` with a new key, `/void` and `/mark-uncollectible` all return `409 payment_pending`; the PSP is charged once |
+| `reconciler_marks_invoice_paid_when_psp_charged` | The first lookup waits for its delay; then a PSP `succeeded` marks the attempt `succeeded` and the invoice `paid`, and emits `invoice.paid` |
+| `reconciler_fails_attempt_when_psp_has_no_charge` | A PSP `404` marks the attempt `failed` (`psp_no_charge`) and emits `invoice.payment_failed`; the invoice can then be paid |
+| `reconciler_backs_off_while_psp_cannot_answer` | A PSP `processing` leaves the attempt `pending_resolution` with the next lookup backed off |
+| `reconciler_adopts_attempt_abandoned_by_crash` | A `pending` attempt minutes old is resolved; a fresh one (request still in flight) is left alone |
 
 ---
 

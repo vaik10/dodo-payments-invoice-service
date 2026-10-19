@@ -8,7 +8,12 @@ info:
 
     **Errors** share a single shape, `ErrorResponse`. `error` is a stable machine-readable code and
     `message` is human-readable. State-machine rejections also carry `current_state` and `requested_state`,
-    and PSP timeouts carry `payment_attempt_id`.
+    and PSP timeouts and `payment_pending` rejections carry `payment_attempt_id`.
+
+    **Unknown payment outcomes** (PSP timeout or error) are resolved by a background reconciler that looks
+    the charge up at the PSP. Until then the invoice is pinned to `issued`: `/pay`, `/void` and
+    `/mark-uncollectible` return `409 payment_pending`. The result arrives as an `invoice.paid` or
+    `invoice.payment_failed` webhook, and can be polled with `GET /payment-attempts/{id}`.
 
     **Webhooks** are POSTed as JSON to registered endpoints with these headers:
     - `Dodo-Signature: t={unix_ts},v1={hex(HMAC-SHA256(signing_secret, "{unix_ts}.{raw_body}"))}`
@@ -80,6 +85,26 @@ components:
             message: Cannot transition invoice from 'paid' to 'void'
             current_state: paid
             requested_state: void
+    InvalidTransitionOrPaymentPending:
+      description: |
+        The invoice's current state does not allow this transition (`invalid_state_transition`), or the
+        invoice has a payment whose outcome is not yet known (`payment_pending`)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            invalid_state_transition:
+              value:
+                error: invalid_state_transition
+                message: Cannot transition invoice from 'paid' to 'void'
+                current_state: paid
+                requested_state: void
+            payment_pending:
+              value:
+                error: payment_pending
+                message: A payment attempt for this invoice has not been resolved yet
+                payment_attempt_id: 09708008-e502-4ac1-97e2-3031b9b18da2
     InvoiceTransitioned:
       description: Invoice after the transition
       content:
@@ -107,7 +132,9 @@ components:
         payment_attempt_id:
           type: string
           format: uuid
-          description: Present on `psp_timeout`; the attempt whose outcome is unknown
+          description: |
+            Present on `psp_timeout` (the attempt whose outcome is unknown) and on `payment_pending`
+            (the unresolved attempt blocking the request)
 
     CreateBusinessRequest:
       type: object
@@ -264,11 +291,15 @@ components:
           format: int64
         status:
           type: string
-          enum: [succeeded, failed]
+          enum: [pending, pending_resolution, succeeded, failed]
+          description: |
+            `pending`: the PSP call is in progress. `pending_resolution`: the PSP timed out or errored and the
+            reconciler is finding out what happened. `succeeded` and `failed` are final.
         failure_code:
           type: string
           nullable: true
           example: card_declined
+          description: The PSP's decline code, or `psp_no_charge` if reconciliation found the PSP never charged
         failure_message:
           type: string
           nullable: true
@@ -532,7 +563,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          $ref: '#/components/responses/InvalidTransition'
+          $ref: '#/components/responses/InvalidTransitionOrPaymentPending'
 
   /invoices/{id}/mark-uncollectible:
     post:
@@ -547,7 +578,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          $ref: '#/components/responses/InvalidTransition'
+          $ref: '#/components/responses/InvalidTransitionOrPaymentPending'
 
   /invoices/{id}/reopen:
     post:
@@ -570,7 +601,8 @@ paths:
       description: |
         Charges the invoice total through the PSP. Requires an `Idempotency-Key`: a retry with the same
         key and body replays the original response without calling the PSP again. Concurrent requests for the
-        same invoice are serialized by a row lock, so at most one can charge.
+        same invoice are serialized by a row lock, and an invoice can have only one unresolved attempt, so at
+        most one can charge.
 
         On success the invoice becomes `paid` and `invoice.paid` is emitted. On a decline the invoice stays
         `issued` and `invoice.payment_failed` is emitted.
@@ -609,8 +641,10 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           description: |
-            Invoice is not `issued` (`invalid_state_transition`, e.g. already paid), or a request with this
-            idempotency key is still in flight (`concurrent_request`).
+            Invoice is not `issued` (`invalid_state_transition`, e.g. already paid), a request with this
+            idempotency key is still in flight (`concurrent_request`), or an earlier attempt on this invoice
+            is unresolved (`payment_pending`, with its `payment_attempt_id`). `payment_pending` applies to any
+            idempotency key.
           content:
             application/json:
               schema:
@@ -629,7 +663,9 @@ paths:
         '504':
           description: |
             The PSP timed out (5s) or errored, so the charge outcome is unknown. The invoice stays `issued`, and
-            the attempt is recorded as `pending_resolution` under `payment_attempt_id`.
+            the attempt is recorded as `pending_resolution` under `payment_attempt_id`. The reconciler resolves it
+            (first PSP lookup after ~30s) and emits `invoice.paid` or `invoice.payment_failed`. A same-key retry
+            replays this 504; use `GET /payment-attempts/{id}` for the current state.
           content:
             application/json:
               schema:
@@ -638,6 +674,24 @@ paths:
                 error: psp_timeout
                 message: Payment processing timeout, state is pending resolution
                 payment_attempt_id: 09708008-e502-4ac1-97e2-3031b9b18da2
+
+  /payment-attempts/{id}:
+    get:
+      summary: Get a payment attempt
+      description: Current state of an attempt, e.g. to follow a `pending_resolution` attempt from a `504`.
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: The payment attempt
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentAttemptResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
 
   /webhook-endpoints:
     post:
